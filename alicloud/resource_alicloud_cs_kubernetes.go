@@ -874,55 +874,10 @@ func resourceAlicloudCSKubernetesCreate(d *schema.ResourceData, meta interface{}
 }
 
 func resourceAlicloudCSKubernetesUpdate(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*connectivity.AliyunClient)
-	csService := CsService{client}
 	d.Partial(true)
 	invoker := NewInvoker()
-	if !d.IsNewResource() && d.HasChange("resource_group_id") {
-		var requestInfo cs.ModifyClusterArgs
-		requestInfo.ResourceGroupId = d.Get("resource_group_id").(string)
-
-		response, err := client.WithCsClient(func(csClient *cs.Client) (interface{}, error) {
-			return nil, csClient.ModifyCluster(d.Id(), &requestInfo)
-		})
-		if err != nil {
-			return WrapErrorf(err, DefaultErrorMsg, d.Id(), "ModifyCluster", DenverdinoAliyungo)
-		}
-		addDebug("ModifyCluster", response, requestInfo)
-		d.SetPartial("resource_group_id")
-	}
-
-	// modify cluster name
-	if !d.IsNewResource() && (d.HasChange("name") || d.HasChange("name_prefix")) {
-		var clusterName string
-		if v, ok := d.GetOk("name"); ok {
-			clusterName = v.(string)
-		} else {
-			clusterName = resource.PrefixedUniqueId(d.Get("name_prefix").(string))
-		}
-		var requestInfo *cs.Client
-		var response interface{}
-		if err := invoker.Run(func() error {
-			raw, err := client.WithCsClient(func(csClient *cs.Client) (interface{}, error) {
-				requestInfo = csClient
-				return nil, csClient.ModifyClusterName(d.Id(), clusterName)
-			})
-			response = raw
-			return err
-		}); err != nil && !IsExpectedErrors(err, []string{"ErrorClusterNameAlreadyExist"}) {
-			return WrapErrorf(err, DefaultErrorMsg, d.Id(), "ModifyClusterName", DenverdinoAliyungo)
-		}
-		if debugOn() {
-			requestMap := make(map[string]interface{})
-			requestMap["ClusterId"] = d.Id()
-			requestMap["ClusterName"] = clusterName
-			addDebug("ModifyClusterName", response, requestInfo, requestMap)
-		}
-		d.SetPartial("name")
-		d.SetPartial("name_prefix")
-	}
-
-	if !d.IsNewResource() && d.HasChanges("deletion_protection", "maintenance_window", "enable_rrsa") {
+	// modifyCluster
+	if !d.IsNewResource() && d.HasChanges("resource_group_id", "name", "name_prefix", "deletion_protection", "custom_san", "maintenance_window", "enable_rrsa") {
 		if err := modifyCluster(d, meta, &invoker); err != nil {
 			return WrapErrorf(err, DefaultErrorMsg, d.Id(), "ModifyCluster", AlibabaCloudSdkGoERROR)
 		}
@@ -945,35 +900,11 @@ func resourceAlicloudCSKubernetesUpdate(d *schema.ResourceData, meta interface{}
 
 	// migrate cluster to pro form standard
 	if d.HasChange("cluster_spec") {
-		oldValue, newValue := d.GetChange("cluster_spec")
-		o, ok := oldValue.(string)
-		if ok != true {
-			return WrapErrorf(fmt.Errorf("cluster_spec old value can not be parsed"), "parseError %d", oldValue)
-		}
-		n, ok := newValue.(string)
-		if ok != true {
-			return WrapErrorf(fmt.Errorf("cluster_pec new value can not be parsed"), "parseError %d", newValue)
-		}
-
-		// The field `cluster_spec` of some ack.standard managed cluster is "" since some historical reasons.
-		// The logic here is to confirm whether the cluster is the above.
-		// The interface error should not block the main process and errors will be output to the log.
-		clusterInfo, err := csService.DescribeCsManagedKubernetes(d.Id())
-		if err != nil || clusterInfo == nil {
-			log.Printf("[DEBUG] Failed to DescribeCsManagedKubernetes cluster %s when migrate", d.Id())
-		} else {
-			o = clusterInfo.ClusterSpec
-		}
-
-		if (o == "ack.standard" || o == "") && strings.Contains(n, "pro") {
-			err := migrateAlicloudManagedKubernetesCluster(d, meta)
-			if err != nil {
-				return WrapErrorf(err, ResponseCodeMsg, d.Id(), "MigrateCluster", AlibabaCloudSdkGoERROR)
-			}
+		err := migrateCluster(d, meta)
+		if err != nil {
+			return WrapError(err)
 		}
 	}
-
-	d.SetPartial("tags")
 
 	err := UpgradeAlicloudKubernetesCluster(d, meta)
 	if err != nil {
@@ -984,11 +915,59 @@ func resourceAlicloudCSKubernetesUpdate(d *schema.ResourceData, meta interface{}
 	return resourceAlicloudCSKubernetesRead(d, meta)
 }
 
+func migrateCluster(d *schema.ResourceData, meta interface{}) error {
+	client := meta.(*connectivity.AliyunClient)
+	csService := CsService{client}
+	oldValue, newValue := d.GetChange("cluster_spec")
+	o, ok := oldValue.(string)
+	if ok != true {
+		return WrapErrorf(fmt.Errorf("cluster_spec old value can not be parsed"), "parseError %d", oldValue)
+	}
+	n, ok := newValue.(string)
+	if ok != true {
+		return WrapErrorf(fmt.Errorf("cluster_pec new value can not be parsed"), "parseError %d", newValue)
+	}
+
+	// The field `cluster_spec` of some ack.standard managed cluster is "" since some historical reasons.
+	// The logic here is to confirm whether the cluster is the above.
+	// The interface error should not block the main process and errors will be output to the log.
+	clusterInfo, err := csService.DescribeCsManagedKubernetes(d.Id())
+	if err != nil || clusterInfo == nil {
+		log.Printf("[DEBUG] Failed to DescribeCsManagedKubernetes cluster %s when migrate", d.Id())
+	} else {
+		o = clusterInfo.ClusterSpec
+	}
+
+	if (o == "ack.standard" || o == "") && strings.Contains(n, "pro") {
+		err := migrateAlicloudManagedKubernetesCluster(d, meta)
+		if err != nil {
+			return WrapErrorf(err, ResponseCodeMsg, d.Id(), "MigrateCluster", AlibabaCloudSdkGoERROR)
+		}
+	}
+
+	return nil
+}
+
 func modifyCluster(d *schema.ResourceData, meta interface{}, invoker *Invoker) error {
 	request := &roacs.ModifyClusterRequest{}
 	client := meta.(*connectivity.AliyunClient)
 	csClient, err := client.NewRoaCsClient()
 	csService := CsService{client}
+
+	if !d.IsNewResource() && d.HasChange("resource_group_id") {
+		request.SetResourceGroupId(d.Get("resource_group_id").(string))
+	}
+
+	if !d.IsNewResource() && (d.HasChange("name") || d.HasChange("name_prefix")) {
+		var clusterName string
+		if v, ok := d.GetOk("name"); ok {
+			clusterName = v.(string)
+		} else {
+			clusterName = resource.PrefixedUniqueId(d.Get("name_prefix").(string))
+		}
+		request.SetClusterName(clusterName)
+	}
+
 	// modify cluster deletion protection
 	if !d.IsNewResource() && d.HasChange("deletion_protection") {
 		v := d.Get("deletion_protection")
@@ -1024,6 +1003,15 @@ func modifyCluster(d *schema.ResourceData, meta interface{}, invoker *Invoker) e
 		d.SetPartial("enable_rrsa")
 	}
 
+	if d.HasChange("custom_san") {
+		custom_san := d.Get("custom_san").(string)
+		request.SetApiServerCustomCertSans(
+			&roacs.ModifyClusterRequestApiServerCustomCertSans{
+				SubjectAlternativeNames: tea.StringSlice(strings.Split(custom_san, ",")),
+				Action:                  tea.String("overwrite"),
+			},
+		)
+	}
 	if err := invoker.Run(func() error {
 		_, err := csClient.ModifyCluster(tea.String(d.Id()), request)
 		return err
@@ -1257,7 +1245,7 @@ func resourceAlicloudCSKubernetesRead(d *schema.ResourceData, meta interface{}) 
 
 	// get cluster conn certs
 	// If the cluster is failed, there is no need to get cluster certs
-	if object.State == "failed" {
+	if object.State == "failed" || object.State == "deleted_failed" || object.State == "deleting" {
 		return nil
 	}
 	var requestInfo *cs.Client
@@ -2037,4 +2025,33 @@ func fetchWorkerNodes(d *schema.ResourceData, meta interface{}) []map[string]int
 	}
 
 	return workerNodes
+}
+
+func flattenTags(config []*roacs.Tag) map[string]string {
+	m := make(map[string]string, len(config))
+	if len(config) < 0 {
+		return m
+	}
+
+	for _, tag := range config {
+		key := tea.StringValue(tag.Key)
+		value := tea.StringValue(tag.Value)
+		if key != DefaultClusterTag && key != CsPlayerAccountIdTag {
+			m[key] = value
+		}
+	}
+
+	return m
+}
+
+func fetchClusterMetaDataMap(meta string) map[string]interface{} {
+	metadata := make(map[string]interface{}, 0)
+	if meta != "" {
+		err := json.Unmarshal([]byte(meta), &metadata)
+		if err != nil {
+			log.Printf("[DEBUG] Failed to unmarshal metadata due to %++v", err)
+		}
+	}
+
+	return metadata
 }

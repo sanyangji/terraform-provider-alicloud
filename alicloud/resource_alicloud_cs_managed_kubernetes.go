@@ -464,7 +464,6 @@ func resourceAlicloudCSManagedKubernetes() *schema.Resource {
 			"custom_san": {
 				Type:     schema.TypeString,
 				Optional: true,
-				ForceNew: true,
 			},
 			"encryption_provider_key": {
 				Type:        schema.TypeString,
